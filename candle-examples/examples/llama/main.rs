@@ -136,7 +136,10 @@ fn main() -> Result<()> {
         let config_filename = api.get("config.json")?;
         let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
         let config = config.into_config(args.use_flash_attn);
-
+        println!(
+            "config: {:?} {}",
+            config.num_attention_heads, config.num_key_value_heads
+        );
         let filenames = match args.which {
             Which::V1 | Which::V2 | Which::Solar10_7B => {
                 candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
@@ -184,6 +187,8 @@ fn main() -> Result<()> {
                 &tokens[start_at..],
             )?
         };
+        // println!("logits shape: {:?}", logits.shape());
+        // println!("logits: {:?}", logits.to_vec1::<f32>());
         index_pos += ctxt.len();
 
         let next_token = logits_processor.sample(&logits)?;

@@ -1,0 +1,41 @@
+[package]
+name = "att"
+version = "0.1.0"
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+candle = { workspace = true }
+candle-datasets = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+candle-flash-attn = { workspace = true, optional = true }
+candle-onnx = { workspace = true, optional = true }
+
+csv = "1.3.0"
+cudarc = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+hf-hub = { workspace = true, features = ["tokio"] }
+image = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+num-traits = { workspace = true }
+pyo3 = { version = "0.20.0", features = ["auto-initialize"], optional = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+tokenizers = { workspace = true, features = ["onig"] }
+polars = { workspace = true }
+clap = {workspace = true}
+regex = "1.10.2"
+itertools = "0.12.0"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+bincode = "1.3.3"

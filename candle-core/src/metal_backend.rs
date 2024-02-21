@@ -7,8 +7,9 @@ use candle_metal_kernels::Kernels;
 use metal;
 use metal::{Buffer, CommandBuffer, CommandQueue, MTLResourceOptions, NSUInteger};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::path::Path;
-use std::sync::{Arc, RwLock, TryLockError};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 
 /// Simple way to catch lock error without
 /// depending on T
@@ -84,13 +85,8 @@ pub struct MetalDevice {
     command_buffer_index: Arc<RwLock<usize>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
-    /// Every compute command encoder (and blit encoders) are defended with this Fence, forcing the
-    /// execution order to be linear.
-    /// It could be relaxed in some circumstances, by managing ourselves the dependencies in the
-    /// compute graph.
-    fence: metal::Fence,
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
-    /// Heavily used by [`candle_metal_kernels`], both fences need to match
+    /// Heavily used by [`candle_metal_kernels`]
     kernels: Arc<candle_metal_kernels::Kernels>,
     /// Simple allocator struct.
     /// The buffers are stored in size buckets since ML tends to use similar shapes over and over.
@@ -106,6 +102,8 @@ pub struct MetalDevice {
     /// Whenever we actually allocate a new buffer, we make a full sweep to cleanup unused buffers
     /// (strong_count = 1).
     buffers: AllocatedBuffers,
+    /// Seed for random number generation.
+    seed: Arc<Mutex<Buffer>>,
 }
 
 impl std::fmt::Debug for MetalDevice {
@@ -221,10 +219,8 @@ impl MetalDevice {
         let command_buffer = self.command_buffer()?;
         command_buffer.set_label("with_data");
         let blit = command_buffer.new_blit_command_encoder();
-        blit.wait_for_fence(&self.fence);
         blit.set_label("with_data_blit");
         blit.copy_from_buffer(&tmp, 0, &real, 0, tmp.length());
-        blit.update_fence(&self.fence);
         blit.end_encoding();
 
         // This is necessary, for mmaped safetensors
@@ -232,10 +228,31 @@ impl MetalDevice {
         // The slice might not live long enough for metal
         // To actually fill the GPU buffer.
         // Putting this wait forces the GPU buffer to be filled
-        // with the actual data allowing the CPU storage todo
+        // with the actual data allowing the CPU storage to do
         // deallocate properly.
         self.wait_until_completed()?;
         Ok(real)
+    }
+
+    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
+        let buffer = self.allocate_buffer(
+            size_in_bytes as NSUInteger,
+            MTLResourceOptions::StorageModePrivate,
+            "allocate_zeros",
+        )?;
+        let command_buffer = self.command_buffer()?;
+        command_buffer.set_label("zeros");
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.fill_buffer(
+            &buffer,
+            metal::NSRange {
+                location: 0,
+                length: buffer.length(),
+            },
+            0,
+        );
+        blit.end_encoding();
+        Ok(buffer)
     }
 
     /// The critical allocator algorithm
@@ -308,35 +325,14 @@ impl BackendStorage for MetalStorage {
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        let length = self.buffer.length() as usize;
-        let size = self.dtype.size_in_bytes();
-        if length % size != 0 {
-            crate::bail!(
-                "The Metal buffer length is not aligned with dtype {:?}",
-                self.dtype
-            );
-        }
-        let buffer = self.device.new_buffer_managed(self.buffer.length())?;
-        {
-            let command_buffer = self.device.command_buffer()?;
-            command_buffer.set_label("to_cpu");
-            let blit = command_buffer.new_blit_command_encoder();
-            blit.set_label("blit_to_cpu");
-            blit.wait_for_fence(&self.device.fence);
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
-            blit.update_fence(&self.device.fence);
-            blit.end_encoding();
-        }
-        self.device.wait_until_completed()?;
-
         match self.dtype {
-            DType::U8 => Ok(CpuStorage::U8(read_to_vec(&buffer, length / size))),
-            DType::U32 => Ok(CpuStorage::U32(read_to_vec(&buffer, length / size))),
-            DType::I64 => Ok(CpuStorage::I64(read_to_vec(&buffer, length / size))),
-            DType::F16 => Ok(CpuStorage::F16(read_to_vec(&buffer, length / size))),
-            DType::BF16 => Ok(CpuStorage::BF16(read_to_vec(&buffer, length / size))),
-            DType::F32 => Ok(CpuStorage::F32(read_to_vec(&buffer, length / size))),
-            DType::F64 => Ok(CpuStorage::F64(read_to_vec(&buffer, length / size))),
+            DType::U8 => Ok(CpuStorage::U8(self.to_cpu()?)),
+            DType::U32 => Ok(CpuStorage::U32(self.to_cpu()?)),
+            DType::I64 => Ok(CpuStorage::I64(self.to_cpu()?)),
+            DType::F16 => Ok(CpuStorage::F16(self.to_cpu()?)),
+            DType::BF16 => Ok(CpuStorage::BF16(self.to_cpu()?)),
+            DType::F32 => Ok(CpuStorage::F32(self.to_cpu()?)),
+            DType::F64 => Ok(CpuStorage::F64(self.to_cpu()?)),
         }
     }
 
@@ -1264,7 +1260,7 @@ impl BackendStorage for MetalStorage {
             let src_offset = (src_l.start_offset() * self.dtype.size_in_bytes()) as NSUInteger;
             let length = (src_l.shape().elem_count() * self.dtype.size_in_bytes()) as NSUInteger;
             let dst_offset = (dst_offset * dst.dtype().size_in_bytes()) as NSUInteger;
-            blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
+            blit.copy_from_buffer(&self.buffer, src_offset, &dst.buffer(), dst_offset, length);
             blit.end_encoding();
         } else {
             let src_shape = src_l.shape();
@@ -1521,6 +1517,28 @@ impl MetalStorage {
         command_buffer.set_label("binary");
         Ok(Self::new(buffer, device.clone(), dtype))
     }
+
+    pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
+        let length = self.buffer.length() as usize;
+        let size = self.dtype.size_in_bytes();
+        if length % size != 0 {
+            crate::bail!(
+                "The Metal buffer length is not aligned with dtype {:?}",
+                self.dtype
+            );
+        }
+        let buffer = self.device.new_buffer_managed(self.buffer.length())?;
+        {
+            let command_buffer = self.device.command_buffer()?;
+            command_buffer.set_label("to_cpu");
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.set_label("blit_to_cpu");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            blit.end_encoding();
+        }
+        self.device.wait_until_completed()?;
+        Ok(read_to_vec(&buffer, length / size))
+    }
 }
 
 impl BackendDevice for MetalDevice {
@@ -1533,27 +1551,27 @@ impl BackendDevice for MetalDevice {
         command_buffer.enqueue();
         let command_buffer = Arc::new(RwLock::new(command_buffer));
         let command_buffer_index = Arc::new(RwLock::new(0));
-        let fence = device.new_fence();
-        let kernels = Arc::new(Kernels::new(fence.clone()));
+        let kernels = Arc::new(Kernels::new());
         let buffers = Arc::new(RwLock::new(HashMap::new()));
         let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
             Ok(val) => val.parse()?,
-            _ => 20,
+            _ => 10,
         };
+        let seed = Arc::new(Mutex::new(device.new_buffer_with_data(
+            [299792458].as_ptr() as *const c_void,
+            4,
+            MTLResourceOptions::StorageModeManaged,
+        )));
         Ok(Self {
             device,
-            fence,
             command_queue,
             command_buffer,
             command_buffer_index,
             compute_per_buffer,
             buffers,
             kernels,
+            seed,
         })
-    }
-
-    fn set_seed(&self, _seed: u64) -> Result<()> {
-        crate::bail!("Metal set_seed not implemented")
     }
 
     fn location(&self) -> crate::DeviceLocation {
@@ -1567,21 +1585,8 @@ impl BackendDevice for MetalDevice {
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
-        let buffer = self.new_buffer(shape.elem_count(), dtype, "zeros")?;
-        let command_buffer = self.command_buffer()?;
-        command_buffer.set_label("zeros");
-        let blit = command_buffer.new_blit_command_encoder();
-        blit.wait_for_fence(&self.fence);
-        blit.fill_buffer(
-            &buffer,
-            metal::NSRange {
-                location: 0,
-                length: buffer.length(),
-            },
-            0,
-        );
-        blit.update_fence(&self.fence);
-        blit.end_encoding();
+        let size = shape.elem_count() * dtype.size_in_bytes();
+        let buffer = self.allocate_zeros(size)?;
         Ok(MetalStorage::new(buffer, self.clone(), dtype))
     }
 
@@ -1608,12 +1613,31 @@ impl BackendDevice for MetalDevice {
         &self,
         shape: &Shape,
         dtype: DType,
-        mean: f64,
-        stddev: f64,
+        min: f64,
+        max: f64,
     ) -> Result<Self::Storage> {
-        // TODO is there a better way ?
-        let cpu_storage = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, mean, stddev)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+        let name = match dtype {
+            DType::F32 => "rand_uniform_f32",
+            DType::F16 => "rand_uniform_f16",
+            DType::BF16 => "rand_uniform_bf16",
+            dtype => crate::bail!("rand_uniform not implemented for {dtype:?}"),
+        };
+        let buffer = self.new_buffer(shape.elem_count(), dtype, "rand_uniform")?;
+        let command_buffer = self.command_buffer()?;
+        candle_metal_kernels::call_random_uniform(
+            &self.device,
+            &command_buffer,
+            &self.kernels,
+            name,
+            min as f32,
+            max as f32,
+            shape.elem_count(),
+            &*self.seed.lock().unwrap(),
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::Storage::new(buffer, self.clone(), dtype))
     }
 
     fn rand_normal(
@@ -1623,9 +1647,43 @@ impl BackendDevice for MetalDevice {
         mean: f64,
         stddev: f64,
     ) -> Result<Self::Storage> {
-        // TODO is there a better way ?
-        let cpu_storage = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, stddev)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+        let name = match dtype {
+            DType::F32 => "rand_normal_f32",
+            DType::F16 => "rand_normal_f16",
+            DType::BF16 => "rand_normal_bf16",
+            dtype => crate::bail!("rand_uniform not implemented for {dtype:?}"),
+        };
+        let buffer = self.new_buffer(shape.elem_count(), dtype, "rand_normal")?;
+        let command_buffer = self.command_buffer()?;
+        candle_metal_kernels::call_random_normal(
+            &self.device,
+            &command_buffer,
+            &self.kernels,
+            name,
+            mean as f32,
+            stddev as f32,
+            shape.elem_count(),
+            &*self.seed.lock().unwrap(),
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::Storage::new(buffer, self.clone(), dtype))
+    }
+
+    fn set_seed(&self, seed: u64) -> Result<()> {
+        let seed: u32 = seed.try_into().map_err(|_| {
+            MetalError::Message("Metal seed must be less than or equal to u32::MAX".to_string())
+        })?;
+
+        let seed_buffer = self.seed.try_lock().map_err(MetalError::from)?;
+        let contents = seed_buffer.contents();
+        unsafe {
+            std::ptr::copy([seed].as_ptr(), contents as *mut u32, 4);
+        }
+        seed_buffer.did_modify_range(metal::NSRange::new(0, 4));
+
+        Ok(())
     }
 }
 

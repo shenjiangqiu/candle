@@ -3,8 +3,12 @@ use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
+pub static ENABLE_SAVE: AtomicBool = AtomicBool::new(false);
+pub static SAVE_PATH: RwLock<String> = RwLock::new(String::new());
 pub const MAX_SEQ_LEN: usize = 4096;
 
 #[derive(Deserialize)]
@@ -134,6 +138,15 @@ impl Cache {
             Ok(mask)
         }
     }
+
+    pub fn clear_kv_cache(&self) {
+        let mut kvs = self.kvs.lock().unwrap();
+        for kv in kvs.iter_mut() {
+            *kv = None;
+        }
+        let mut masks = self.masks.lock().unwrap();
+        masks.clear();
+    }
 }
 
 struct RmsNorm {
@@ -205,7 +218,6 @@ impl CausalSelfAttention {
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
-
         let q = q
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -215,7 +227,8 @@ impl CausalSelfAttention {
         let mut v = v
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
-
+        // println!("attantion:q {:?}", q.dims());
+        // println!("attantion:k {:?}", k.dims());
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let mut k = self.apply_rotary_emb(&k, index_pos)?;
 
@@ -257,8 +270,22 @@ impl CausalSelfAttention {
             let v = v.to_dtype(DType::F32)?;
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             let mask = self.cache.mask(seq_len)?.broadcast_as(att.shape())?;
+
             let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
             let att = candle_nn::ops::softmax(&att, D::Minus1)?;
+
+            // println!("att {:?}", att.dims());
+            if ENABLE_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+                let path = SAVE_PATH.read().unwrap();
+                let name = format!("att-{index_pos}-{block_idx}");
+                let path = Path::new(path.as_str());
+
+                fs::create_dir_all(path).unwrap();
+
+                let path = path.join(&name);
+                att.save_safetensors(&name, &path).unwrap();
+            }
+
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };

@@ -14,6 +14,7 @@ pub mod llama2_c_weights;
 pub mod llama_sink;
 pub mod llama_sink_mix;
 pub mod llama_sink_mix_dynamic;
+pub mod llama_sink_mix_dynamic_no_header_block;
 pub mod llama_sink_mix_test;
 pub mod marian;
 pub mod mistral;

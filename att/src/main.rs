@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn test_broadcast() {
-        let value = Tensor::new(&[[1., 2., 3.], [4., 5., 6.]], &Device::Cpu).unwrap();
-        let mask: Tensor = Tensor::new(&[1., 0.], &Device::Cpu).unwrap();
+        // let value = Tensor::new(&[[1., 2., 3.], [4., 5., 6.]], &Device::Cpu).unwrap();
+        // let mask: Tensor = Tensor::new(&[1., 0.], &Device::Cpu).unwrap();
     }
 
     #[test]

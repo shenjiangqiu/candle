@@ -20,7 +20,9 @@ use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 // use the sink version of llama
-use candle_transformers::models::llama_sink_mix_dynamic::{self as model, MsbIndexItem};
+use candle_transformers::models::llama_sink_mix_dynamic_no_header_block::{
+    self as model, MsbIndexItem,
+};
 
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -224,7 +226,6 @@ fn main() -> Result<()> {
                 evict_threshold,
                 restore_threshold,
             );
-
             // set path
             println!("\n\n-----------------------\ngenerating for prompt: {}", i);
             let file_path = format!("{test_folder}/test_{}", i);
@@ -338,16 +339,18 @@ fn main() -> Result<()> {
                 token_generated as f64 / dt.as_secs_f64(),
             );
             // save the generated text
-            let cache = cache.global_mask.lock().unwrap();
-            let blocks = cache.len();
-            let headers = cache[0].len();
-            let num_false = cache
-                .iter()
-                .flatten()
-                .flatten()
-                .map(|x| if *x { 0 } else { 1 })
-                .sum::<usize>();
-            let total_element = index_pos * blocks * headers;
+            let cache = cache.current_msb_index.lock().unwrap();
+            let num_msb = cache.1.len();
+            let total_element = index_pos;
+            // let blocks = cache.len();
+            // let headers = cache[0].len();
+            // let num_false = cache
+            //     .iter()
+            //     .flatten()
+            //     .flatten()
+            //     .map(|x| if *x { 0 } else { 1 })
+            //     .sum::<usize>();
+            // let total_element = index_pos * blocks * headers;
 
             // fix bug here, each config should write to different file
             let mut f = File::create(
@@ -362,10 +365,10 @@ fn main() -> Result<()> {
             element
                 .write_all(
                     format!(
-                        "total: {}, num_false: {}, ratio: {}\n",
+                        "total: {}, num_msb: {}, ratio: {}\n",
                         total_element,
-                        num_false,
-                        (num_false as f32 / total_element as f32)
+                        num_msb,
+                        (num_msb as f32 / total_element as f32)
                     )
                     .as_bytes(),
                 )

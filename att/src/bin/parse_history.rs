@@ -1,15 +1,13 @@
 use std::{
     fs::read_dir,
     io::{BufReader, BufWriter},
-    iter::Sum,
-    ops::Add,
     path::PathBuf,
 };
 
 use att::{init_logger, MySum};
 use clap::Parser;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+
 use tracing::{debug, info};
 #[derive(Parser)]
 struct Cli {

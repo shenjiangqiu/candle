@@ -39,3 +39,5 @@ candle-wasm-examples/**/config*.json
 .candleenv
 dataset
 tests
+
+result*

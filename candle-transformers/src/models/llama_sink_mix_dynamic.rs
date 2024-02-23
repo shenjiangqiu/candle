@@ -8,20 +8,13 @@ use candle_nn::{embedding, Embedding, Module, VarBuilder};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, info};
-pub static ENABLE_SAVE: AtomicBool = AtomicBool::new(false);
-pub static SAVE_PATH: RwLock<String> = RwLock::new(String::new());
 
 /// changes here: allow super long sequences
 pub const MAX_SEQ_LEN: usize = 4096;
-pub static MAX_WINDOW_SIZE: RwLock<usize> = RwLock::new(1024);
-pub static MAX_SINK_SIZE: RwLock<usize> = RwLock::new(4);
 
-pub static EVICT_THRESHOLD: RwLock<f32> = RwLock::new(0.05);
-pub static RESTORE_THRESHOLD: RwLock<f32> = RwLock::new(0.1);
 #[derive(Deserialize)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -114,7 +107,7 @@ impl KVStore {
         self.sink_kv.iter_mut().for_each(|x| *x = None);
     }
 }
-#[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct MsbIndexItem {
     pub block_idx: usize,
     pub header: usize,
@@ -229,7 +222,6 @@ struct CausalSelfAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    cache: StreamCache,
     use_flash_attn: bool,
     span: tracing::Span,
     span_rot: tracing::Span,
@@ -253,11 +245,16 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+    fn apply_rotary_emb(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &StreamCache,
+    ) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (b_sz, _, seq_len, hidden_size) = x.dims4()?;
-        let cos = self.cache.cos.narrow(0, index_pos, seq_len)?;
-        let sin = self.cache.sin.narrow(0, index_pos, seq_len)?;
+        let cos = cache.cos.narrow(0, index_pos, seq_len)?;
+        let sin = cache.sin.narrow(0, index_pos, seq_len)?;
         let cos = cos.broadcast_as((b_sz, 1, seq_len, hidden_size))?;
         let sin = sin.broadcast_as((b_sz, 1, seq_len, hidden_size))?;
         let x1 = x.narrow(D::Minus1, 0, hidden_size / 2)?;
@@ -274,12 +271,13 @@ impl CausalSelfAttention {
         block_idx: usize,
         _sink_size: usize,
         _window_size: usize,
+        max_sink_size: usize,
+        max_window_size: usize,
+        evict_threshold: f32,
+        restore_threshold: f32,
+        cache: &StreamCache,
     ) -> Result<Tensor> {
         // fix here, if the seq_len is not 1, will do that same as original
-        let max_sink_size = *MAX_SINK_SIZE.read().unwrap();
-        let max_window_size = *MAX_WINDOW_SIZE.read().unwrap();
-        let evict_threshold = *EVICT_THRESHOLD.read().unwrap();
-        let restore_threshold = *RESTORE_THRESHOLD.read().unwrap();
 
         debug!("index_pos: {index_pos}, block_idx: {block_idx}");
         let _enter = self.span.enter();
@@ -301,9 +299,9 @@ impl CausalSelfAttention {
         // println!("attantion:q {:?}", q.dims());
         // println!("attantion:k {:?}", k.dims());
 
-        let q = self.apply_rotary_emb(&q, index_pos)?;
-        let mut k = self.apply_rotary_emb(&k, index_pos)?;
-        let mut cache = self.cache.kvs.lock().unwrap();
+        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
+        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
+        let mut kvs = cache.kvs.lock().unwrap();
 
         let mut k_msb = msb_only(k.to_dtype(DType::F32).unwrap())
             .to_dtype(DType::F16)
@@ -311,7 +309,7 @@ impl CausalSelfAttention {
         let mut v_msb = msb_only(v.to_dtype(DType::F32).unwrap())
             .to_dtype(DType::F16)
             .unwrap();
-        if let Some((cache_k, cache_k_msb, cache_v, cache_v_msb)) = &cache.sink_kv[block_idx] {
+        if let Some((cache_k, cache_k_msb, cache_v, cache_v_msb)) = &kvs.sink_kv[block_idx] {
             k = Tensor::cat(&[cache_k, &k], 2).unwrap().contiguous()?;
             v = Tensor::cat(&[cache_v, &v], 2).unwrap().contiguous()?;
             k_msb = Tensor::cat(&[cache_k_msb, &k_msb], 2)
@@ -322,7 +320,7 @@ impl CausalSelfAttention {
                 .contiguous()?;
         }
 
-        cache.sink_kv[block_idx] = Some((k.clone(), k_msb.clone(), v.clone(), v_msb.clone()));
+        kvs.sink_kv[block_idx] = Some((k.clone(), k_msb.clone(), v.clone(), v_msb.clone()));
 
         let in_dtype = q.dtype();
         let q = q.to_dtype(DType::F32)?;
@@ -342,7 +340,7 @@ impl CausalSelfAttention {
             let att_len = att.dims4().unwrap().2;
             assert_eq!(att_len, seq_len, "att_len should be seq_len");
 
-            let mask = self.cache.mask(seq_len)?.broadcast_as(att.shape())?;
+            let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
 
             let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
             let att = candle_nn::ops::softmax(&att, D::Minus1)?;
@@ -369,7 +367,7 @@ impl CausalSelfAttention {
                 let att_len = att.dims4().unwrap().2;
                 assert_eq!(att_len, seq_len, "att_len should be seq_len");
 
-                let mask = self.cache.mask(seq_len)?.broadcast_as(att.shape())?;
+                let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
 
                 let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
                 let att = candle_nn::ops::softmax(&att, D::Minus1)?;
@@ -381,8 +379,8 @@ impl CausalSelfAttention {
                 // info!("finished att block {}", block_idx);
                 Ok(y)
             } else {
-                let mut global_mask = self.cache.global_mask.lock().unwrap();
-                let mut current_msb = self.cache.current_msb_index.lock().unwrap();
+                let mut global_mask = cache.global_mask.lock().unwrap();
+                let mut current_msb = cache.current_msb_index.lock().unwrap();
                 let (full_mask, msb_mask) =
                     special_handle(cache_len, &global_mask[block_idx], k.dims()[3]);
                 // apply the mask to k and v
@@ -401,7 +399,7 @@ impl CausalSelfAttention {
                 info!("finished QK: {time:?}");
 
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                let mask = self.cache.mask(seq_len)?.broadcast_as(att.shape())?;
+                let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
                 let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
                 let att = candle_nn::ops::softmax(&att, D::Minus1)?;
                 let time = start.elapsed();
@@ -493,7 +491,7 @@ impl CausalSelfAttention {
         }
     }
 
-    fn load(vb: VarBuilder, cache: &StreamCache, cfg: &Config) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
@@ -511,7 +509,6 @@ impl CausalSelfAttention {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            cache: cache.clone(),
             use_flash_attn: cfg.use_flash_attn,
             span,
             span_rot,
@@ -647,22 +644,35 @@ impl Block {
         block_idx: usize,
         sink_size: usize,
         window_size: usize,
+        max_sink_size: usize,
+        max_window_size: usize,
+        evict_threshold: f32,
+        restore_threshold: f32,
+        cache: &StreamCache,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
-        let x = (self
-            .attn
-            .forward(&x, index_pos, block_idx, sink_size, window_size)?
-            + residual)?;
+        let x = (self.attn.forward(
+            &x,
+            index_pos,
+            block_idx,
+            sink_size,
+            window_size,
+            max_sink_size,
+            max_window_size,
+            evict_threshold,
+            restore_threshold,
+            cache,
+        )? + residual)?;
         let residual = &x;
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
         Ok(x)
     }
 
-    fn load(vb: VarBuilder, cache: &StreamCache, cfg: &Config) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cache, cfg)?;
+        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
         let rms_1 = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = RmsNorm::load(
@@ -690,7 +700,16 @@ pub struct Llama {
 }
 
 impl Llama {
-    pub fn forward(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        max_sink_size: usize,
+        max_window_size: usize,
+        evict_threshold: f32,
+        restore_threshold: f32,
+        cache: &StreamCache,
+    ) -> Result<Tensor> {
         info!("running forward of tensor: {:?}", x);
         let (_b_sz, seq_len) = x.dims2()?;
         let start = Instant::now();
@@ -701,7 +720,18 @@ impl Llama {
         info!("time for wte  {time:?}");
         for (block_idx, block) in self.blocks.iter().enumerate() {
             let start = Instant::now();
-            x = block.forward(&x, index_pos, block_idx, self.sink_size, self.window_size)?;
+            x = block.forward(
+                &x,
+                index_pos,
+                block_idx,
+                self.sink_size,
+                self.window_size,
+                max_sink_size,
+                max_window_size,
+                evict_threshold,
+                restore_threshold,
+                cache,
+            )?;
             let time = start.elapsed();
             info!("time for block {block_idx}: {time:?}");
         }
@@ -717,7 +747,6 @@ impl Llama {
 
     pub fn load(
         vb: VarBuilder,
-        cache: &StreamCache,
         cfg: &Config,
         sink_size: usize,
         window_size: usize,
@@ -726,7 +755,7 @@ impl Llama {
         let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         let ln_f = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(&format!("model.layers.{i}")), cache, cfg).unwrap())
+            .map(|i| Block::load(vb.pp(&format!("model.layers.{i}")), cfg).unwrap())
             .collect();
 
         Ok(Self {

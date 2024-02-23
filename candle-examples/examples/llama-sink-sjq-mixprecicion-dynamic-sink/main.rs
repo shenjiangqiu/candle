@@ -14,7 +14,7 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
-use anyhow::{bail, Error as E, Result};
+use anyhow::{bail, Error as E, Ok, Result};
 
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
@@ -34,9 +34,7 @@ use std::io::Write;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::path::Path;
 use std::sync::Mutex;
 use tracing::info;
 
@@ -120,21 +118,22 @@ fn limit_len(i: &Vec<(String, String)>, min: usize, max: usize) -> bool {
         .sum::<usize>();
     words >= min && words <= max
 }
-static CURRENT_MSB_HISTORY: Mutex<Option<Vec<(usize, BTreeSet<MsbIndexItem>)>>> =
-    Mutex::new(Option::None);
-static CURRENT_FILE_PATH: Mutex<Option<PathBuf>> = Mutex::new(Option::None);
+static CTRLC_LOCK: Mutex<bool> = Mutex::new(false);
+
+fn final_save_file(file_path: &Path, history: &Vec<(usize, BTreeSet<MsbIndexItem>)>) {
+    info!("saving history into {file_path:?}");
+    let writer = File::create(Path::new(&file_path).join(format!("cache_mask.bin"))).unwrap();
+    bincode::serialize_into(writer, history).unwrap();
+}
 fn main() -> Result<()> {
     ctrlc::set_handler(move || {
-        info!("ctrl-c received");
-        if let Some(history) = &CURRENT_MSB_HISTORY.lock().unwrap().deref() {
-            let file_path = CURRENT_FILE_PATH.lock().unwrap();
-            let file_path = file_path.as_ref().unwrap();
-            info!("saving history into {file_path:?}");
-            let writer =
-                File::create(Path::new(&file_path).join(format!("cache_mask.bin"))).unwrap();
-            bincode::serialize_into(writer, history).unwrap();
+        let mut lock = CTRLC_LOCK.lock().unwrap();
+        if *lock {
+            info!("already ctrlc");
+            return;
         }
-        exit(0);
+        info!("set ctrl c, system will stop soon");
+        *lock = true;
     })
     .expect("unable to set ctrl-c handler");
     use tokenizers::Tokenizer;
@@ -148,11 +147,7 @@ fn main() -> Result<()> {
                 .from_env_lossy(),
         )
         .init();
-    info!(
-        "run with {}:{}",
-        model::MAX_SINK_SIZE.read().unwrap(),
-        model::MAX_WINDOW_SIZE.read().unwrap()
-    );
+  
     let device = candle_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
@@ -161,7 +156,7 @@ fn main() -> Result<()> {
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
         None => DType::F16,
     };
-    let (llama, tokenizer_filename, cache) = {
+    let (llama, tokenizer_filename,config) = {
         let api = Api::new()?;
         let model_id = args.model_id.unwrap_or_else(|| match args.which {
             Which::V1 => "Narsil/amall-7b".to_string(),
@@ -185,14 +180,14 @@ fn main() -> Result<()> {
             Which::TinyLlama1_1BChat => vec![api.get("model.safetensors")?],
         };
         println!("building the model");
-        let cache = model::StreamCache::new(!args.no_kv_cache, dtype, &config, &device)?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
         (
-            Llama::load(vb, &cache, &config, 4, 1024)?,
+            Llama::load(vb,  &config, 4, 1024)?,
             // Llama::load(vb, &cache, &config)?,
             tokenizer_filename,
-            cache,
+            config,
+
         )
     };
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
@@ -201,42 +196,47 @@ fn main() -> Result<()> {
     // ENABLE_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
     println!("fetching the user prompt");
 
-    for (i, prompt) in fetch_all_user_prompt()
+    fetch_all_user_prompt()
         .unwrap()
         .into_iter()
-        .filter(|i| limit_len(i, 1240, 2048))
+        .filter(|i| limit_len(i, 1240, 4000))
         .take(20)
-        .enumerate()
-    {
+        .enumerate().for_each(|(prompt_idx, prompt)| {
         [(0.01, 0.02), (0.02, 0.05), (0.05, 0.1)].into_iter().for_each(|(evict, restore)|
          {
-            *model::EVICT_THRESHOLD.write().unwrap() = evict;
-            *model::RESTORE_THRESHOLD.write().unwrap()=restore;
-            let max_sink_size = *model::MAX_SINK_SIZE.read().unwrap();
-            let max_window_size = *model::MAX_WINDOW_SIZE.read().unwrap();
+            [(4,1024),(4,1)].into_iter().for_each(|(max_sink_size,max_window_size)|{
+
+            if *CTRLC_LOCK.lock().unwrap(){
+                return;
+            }
             let evict_threshold = evict;
             let restore_threshold = restore;
 
-            let test_folder = format!(
-                "tests/llama_7b_chat_1240_logits_sink_mix_dynamic-sink[{}]-hist[{}]-evict[{}]-restor[{}]",
+            let _test_folder = format!(
+                "tests/0223llama_7b_chat_1240_logits_sink_mix_dynamic-sink[{}]-hist[{}]-evict[{}]-restor[{}]",
                 max_sink_size,
                 max_window_size,
                 evict_threshold,
                 restore_threshold,
             );
-
             // set path
-            println!("\n\n-----------------------\ngenerating for prompt: {}", i);
-            let file_path = format!("{test_folder}/test_{}", i);
-            fs::create_dir_all(&file_path).unwrap();
-            *CURRENT_FILE_PATH.lock().unwrap()=Some(Path::new(&file_path).to_owned());
+            println!("\n\n-----------------------\ngenerating for prompt: {}", prompt_idx);
+            let _file_path = format!("{_test_folder}/test_{}", prompt_idx);
+            let _file_path = Path::new(&_file_path);
+            let history_path = _file_path.join("history.bin");
+            let prompt_path = _file_path.join(format!("1-prompts-{}-{}.txt", evict, restore));
+            let element_path= _file_path.join(format!("1-ele-{}-{}.txt", evict, restore));
+            fs::create_dir_all(&_file_path).unwrap();
 
             // let mut save_path = SAVE_PATH.write().unwrap();
             // *save_path = file_path.clone();
             // drop(save_path);
             // clear the cache
             let mut real_prompt = build_prompt(&prompt);
-            cache.clear_kv_cache();
+            let mut history = vec![];
+            let cache = model::StreamCache::new(!args.no_kv_cache, dtype, &config, &device).unwrap();
+
+
             let mut tokens = tokenizer
                 .encode(real_prompt.as_str(), true)
                 .map_err(E::msg).unwrap()
@@ -255,48 +255,44 @@ fn main() -> Result<()> {
             // first feed 0..MAX_SINK_SIZE + MAX_WINDOW_SIZE
             let ctxt = &tokens[0..(max_sink_size + max_window_size).min(tokens.len() - 1)];
             let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
-            let _logits = llama.forward(&input, 0).unwrap();
+            let _logits = llama.forward(&input, 0,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
 
             index_pos += ctxt.len();
-            let update_save_to_file = |i:usize,index_pos:usize| {
-                let cache_mask = cache.current_msb_index.lock().unwrap();
-                    let cache_mask = cache_mask.deref();
-                    let mut current_msb_history = CURRENT_MSB_HISTORY.lock().unwrap();
-                    let  history = current_msb_history.get_or_insert(vec![]);
-                    history.push(cache_mask.clone());
-
-                    let writer = File::create(
-                        Path::new(&file_path).join(format!("cache_mask-{}-{}.bin", i, index_pos)),
-                    )
-                    .unwrap();
-                    bincode::serialize_into(writer, cache_mask).unwrap();
-            };
+           
             // then feed the rest one by one
             for i in (max_sink_size + max_window_size)..(tokens.len() - 1) {
+               
                 // one token from the prompt
                 let ctxt = &tokens[i..(i + 1)];
                 let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
 
-                // save current cache mask
-                {
-                    update_save_to_file(i,index_pos);
+                history.push(cache.current_msb_index.lock().unwrap().clone());
+                if *CTRLC_LOCK.lock().unwrap() {
+                    // save and return
+                    final_save_file(&history_path, &history);
+                    return;
                 }
 
-                let _logits = llama.forward(&input, index_pos).unwrap();
+                let _logits = llama.forward(&input, index_pos,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
+
                 index_pos += ctxt.len();
                 info!("{}/{} tokens in prompt finished", i, (tokens.len() - 1 - 1));
             }
-
             // then feed the rest
             for _index in 0..100 {
-                // save current cache mask
-                {
-                    update_save_to_file(tokens.len() - 1,index_pos);
-                }
+             
                 // always fetch the last token inserted
                 let ctxt = &tokens[(tokens.len() - 1)..];
                 let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
-                let logits = llama.forward(&input, index_pos).unwrap();
+
+                history.push(cache.current_msb_index.lock().unwrap().clone());
+                if *CTRLC_LOCK.lock().unwrap() {
+                    // save and return
+                    final_save_file(&history_path, &history);
+                    return;
+                }
+
+                let logits = llama.forward(&input, index_pos,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
                 let logits = logits.squeeze(0).unwrap();
                 // println!("logits shape: {:.unwrap()}", logits.shape());
                 // println!("logits: {:.unwrap()}", logits.to_vec1::<f32>());
@@ -351,14 +347,15 @@ fn main() -> Result<()> {
 
             // fix bug here, each config should write to different file
             let mut f = File::create(
-                Path::new(&file_path).join(format!("1-prompts-{}-{}.txt", evict, restore)),
+                &prompt_path
             )
             .unwrap();
             let mut element = File::create(
-                Path::new(&file_path).join(format!("1-ele-{}-{}.txt", evict, restore)),
+                &element_path
             )
             .unwrap();
             f.write_all(real_prompt.as_bytes()).unwrap();
+            final_save_file(&history_path,&history);
             element
                 .write_all(
                     format!(
@@ -367,15 +364,14 @@ fn main() -> Result<()> {
                         num_false,
                         (num_false as f32 / total_element as f32)
                     )
-                    .as_bytes(),
-                )
+                    .as_bytes())
                 .unwrap();
-
-
+        });
 
             }
+            
         ) ;
-    }
+    });
 
     Ok(())
 }

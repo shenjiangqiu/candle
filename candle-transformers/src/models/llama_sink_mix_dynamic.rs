@@ -2,15 +2,17 @@
 //! 1. we store the tensor after ROPE
 //! 2. for tensors in sink, we use the full tensor, for others, we use the MSB
 
-use super::with_tracing::{linear_no_bias as linear, Linear};
-use candle::{CpuStorage, CustomOp1, DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::{embedding, Embedding, Module, VarBuilder};
-
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+
+use candle::{CpuStorage, CustomOp1, D, Device, DType, IndexOp, Result, Tensor};
+use candle_nn::{embedding, Embedding, Module, VarBuilder};
+
+use super::with_tracing::{Linear, linear_no_bias as linear};
 
 /// changes here: allow super long sequences
 pub const MAX_SEQ_LEN: usize = 4096;
@@ -107,12 +109,14 @@ impl KVStore {
         self.sink_kv.iter_mut().for_each(|x| *x = None);
     }
 }
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct MsbIndexItem {
     pub block_idx: usize,
     pub header: usize,
     pub seq: usize,
 }
+
 #[derive(Clone)]
 pub struct StreamCache {
     masks: Arc<Mutex<HashMap<usize, Tensor>>>,
@@ -129,6 +133,7 @@ pub struct StreamCache {
     // 3. resotre the mask if it's attention is large
     pub global_mask: Arc<Mutex<Vec<Vec<[bool; MAX_SEQ_LEN]>>>>,
     pub current_msb_index: Arc<Mutex<(usize, BTreeSet<MsbIndexItem>)>>,
+    pub current_round_evict_restore: Arc<Mutex<CurrentRoundEvictRestore>>,
 }
 
 impl StreamCache {
@@ -163,6 +168,10 @@ impl StreamCache {
                 ];
                 config.num_hidden_layers
             ])),
+            current_round_evict_restore: Arc::new(Mutex::new(CurrentRoundEvictRestore {
+                evict: BTreeSet::new(),
+                restore: BTreeSet::new(),
+            })),
             current_msb_index: Default::default(),
         })
     }
@@ -213,6 +222,7 @@ impl RmsNorm {
         self.inner.forward(x)
     }
 }
+
 #[allow(dead_code)]
 struct CausalSelfAttention {
     q_proj: Linear,
@@ -236,6 +246,12 @@ fn flash_attn(
     causal: bool,
 ) -> Result<Tensor> {
     candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CurrentRoundEvictRestore {
+    pub evict: BTreeSet<MsbIndexItem>,
+    pub restore: BTreeSet<MsbIndexItem>,
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -380,6 +396,7 @@ impl CausalSelfAttention {
                 Ok(y)
             } else {
                 let mut global_mask = cache.global_mask.lock().unwrap();
+                let mut current_round_evict_restore = cache.current_round_evict_restore.lock().unwrap();
                 let mut current_msb = cache.current_msb_index.lock().unwrap();
                 let (full_mask, msb_mask) =
                     special_handle(cache_len, &global_mask[block_idx], k.dims()[3]);
@@ -409,6 +426,7 @@ impl CausalSelfAttention {
                     block_idx,
                     &mut global_mask[block_idx],
                     &mut current_msb,
+                    &mut current_round_evict_restore,
                     index_pos,
                     seq_len,
                     &att,
@@ -432,6 +450,7 @@ impl CausalSelfAttention {
         block_idx: usize,
         cache: &mut Vec<[bool; MAX_SEQ_LEN]>,
         current_msb_history: &mut (usize, BTreeSet<MsbIndexItem>),
+        current_round_evict_restore: &mut CurrentRoundEvictRestore,
         index_pos: usize,
         seq_len: usize,
         att: &Tensor,
@@ -440,6 +459,8 @@ impl CausalSelfAttention {
         evict_threshold: f32,
         restore_threshold: f32,
     ) {
+        current_round_evict_restore.restore.clear();
+        current_round_evict_restore.evict.clear();
         if seq_len != 1 {
             panic!("seq_len should be 1");
         }
@@ -452,6 +473,7 @@ impl CausalSelfAttention {
         );
         // info!("att:{:?}",att.get_on_dim(1,0).unwrap().to_vec3::<f32>().unwrap());
         let tokenindex_to_be_evicted = index_pos - max_window_size;
+        assert!(tokenindex_to_be_evicted >= max_sink_size);
         // first the token that go out of the window should set to use MSB, if the att score for that token is large. we should restore the mask
         for header in 0..32 {
             let atten_header = att.get_on_dim(1, header).unwrap();
@@ -471,16 +493,27 @@ impl CausalSelfAttention {
                     header,
                     seq: tokenindex_to_be_evicted,
                 });
+                // mean the token is evicted
+                current_round_evict_restore.evict.insert(MsbIndexItem {
+                    block_idx,
+                    header,
+                    seq: tokenindex_to_be_evicted,
+                });
             } else {
                 cache[header][tokenindex_to_be_evicted] = true;
             }
             // restore the mask if the score is large
-            for out_window_index in (max_sink_size + 1)..tokenindex_to_be_evicted {
+            for out_window_index in max_sink_size..tokenindex_to_be_evicted {
                 let score = atten_header.get_on_dim(2, out_window_index).unwrap();
                 let score: f32 = score.flatten_all().unwrap().to_vec1().unwrap()[0];
                 if score > restore_threshold {
                     cache[header][out_window_index] = true;
                     current_msb_history.1.remove(&MsbIndexItem {
+                        block_idx,
+                        header,
+                        seq: out_window_index,
+                    });
+                    current_round_evict_restore.restore.insert(MsbIndexItem {
                         block_idx,
                         header,
                         seq: out_window_index,
@@ -515,7 +548,9 @@ impl CausalSelfAttention {
         })
     }
 }
+
 struct MsbOnly;
+
 impl CustomOp1 for MsbOnly {
     fn name(&self) -> &'static str {
         "MSBOnly"
@@ -542,6 +577,7 @@ impl CustomOp1 for MsbOnly {
         Ok((data, layout.shape().clone()))
     }
 }
+
 fn msb_only(x: Tensor) -> Tensor {
     x.apply_op1(MsbOnly).unwrap()
 }
@@ -561,7 +597,7 @@ fn special_handle(
                 .take(part_length)
                 .map(|y| {
                     if *y {
-                        vec![1. as f32; header_dim]
+                        vec![1f32; header_dim]
                     } else {
                         vec![0.; header_dim]
                     }
@@ -576,7 +612,7 @@ fn special_handle(
                 .take(part_length)
                 .map(|y| {
                     if *y {
-                        vec![0. as f32; header_dim]
+                        vec![0f32; header_dim]
                     } else {
                         vec![1.; header_dim]
                     }
@@ -772,6 +808,7 @@ impl Llama {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_tensor_get() {
         let device = Device::Cpu;

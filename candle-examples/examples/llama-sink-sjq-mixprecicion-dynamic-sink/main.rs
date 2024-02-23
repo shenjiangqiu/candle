@@ -10,33 +10,31 @@
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
-
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
+use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
+use std::sync::Mutex;
+
 use anyhow::{bail, Error as E, Ok, Result};
+use clap::{Parser, ValueEnum};
+use hf_hub::{api::sync::Api, Repo, RepoType};
+use itertools::Itertools;
+use polars::lazy::dsl::col;
+use polars::prelude::*;
+use tracing::info;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 // use the sink version of llama
-use candle_transformers::models::llama_sink_mix_dynamic::{self as model, MsbIndexItem};
-
-use clap::{Parser, ValueEnum};
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use itertools::Itertools;
+use candle_transformers::models::llama_sink_mix_dynamic::{MsbIndexItem, self as model, CurrentRoundEvictRestore};
 use model::{Llama, LlamaConfig};
-use polars::lazy::dsl::col;
-use polars::prelude::*;
-use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::Write;
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::EnvFilter;
-
-use std::path::Path;
-use std::sync::Mutex;
-use tracing::info;
 
 const EOS_TOKEN: &str = "</s>";
 // const DEFAULT_PROMPT: &str = "My favorite theorem is ";
@@ -111,6 +109,7 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
 }
+
 fn limit_len(i: &Vec<(String, String)>, min: usize, max: usize) -> bool {
     let words = i
         .iter()
@@ -118,13 +117,15 @@ fn limit_len(i: &Vec<(String, String)>, min: usize, max: usize) -> bool {
         .sum::<usize>();
     words >= min && words <= max
 }
+
 static CTRLC_LOCK: Mutex<bool> = Mutex::new(false);
 
-fn final_save_file(file_path: &Path, history: &Vec<(usize, BTreeSet<MsbIndexItem>)>) {
+fn final_save_file(file_path: &Path, history: &Vec<CurrentRoundEvictRestore>) {
     info!("saving history into {file_path:?}");
     let writer = File::create(Path::new(&file_path).join(format!("cache_mask.bin"))).unwrap();
     bincode::serialize_into(writer, history).unwrap();
 }
+
 fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         let mut lock = CTRLC_LOCK.lock().unwrap();
@@ -135,7 +136,7 @@ fn main() -> Result<()> {
         info!("set ctrl c, system will stop soon");
         *lock = true;
     })
-    .expect("unable to set ctrl-c handler");
+        .expect("unable to set ctrl-c handler");
     use tokenizers::Tokenizer;
     // use tracing_chrome::ChromeLayerBuilder;
     // use tracing_subscriber::prelude::*;
@@ -147,7 +148,7 @@ fn main() -> Result<()> {
                 .from_env_lossy(),
         )
         .init();
-  
+
     let device = candle_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
@@ -156,7 +157,7 @@ fn main() -> Result<()> {
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
         None => DType::F16,
     };
-    let (llama, tokenizer_filename,config) = {
+    let (llama, tokenizer_filename, config) = {
         let api = Api::new()?;
         let model_id = args.model_id.unwrap_or_else(|| match args.which {
             Which::V1 => "Narsil/amall-7b".to_string(),
@@ -183,11 +184,10 @@ fn main() -> Result<()> {
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
         (
-            Llama::load(vb,  &config, 4, 1024)?,
+            Llama::load(vb, &config, 4, 1024)?,
             // Llama::load(vb, &cache, &config)?,
             tokenizer_filename,
             config,
-
         )
     };
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
@@ -195,182 +195,155 @@ fn main() -> Result<()> {
     println!("finished loading the model");
     // ENABLE_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
     println!("fetching the user prompt");
-
+    use rayon::prelude::*;
     fetch_all_user_prompt()
         .unwrap()
         .into_iter()
         .filter(|i| limit_len(i, 1240, 4000))
         .take(20)
         .enumerate().for_each(|(prompt_idx, prompt)| {
-        [(0.01, 0.02), (0.02, 0.05), (0.05, 0.1)].into_iter().for_each(|(evict, restore)|
-         {
-            [(4,1024),(4,1)].into_iter().for_each(|(max_sink_size,max_window_size)|{
+        [(0.01, 0.02), (0.02, 0.05), (0.05, 0.1)].into_par_iter().for_each(|(evict, restore)|
+            {
+                [(4, 1024), (4, 1), (40, 1024), (40, 1)].into_par_iter().for_each(|(max_sink_size, max_window_size)| {
+                    if *CTRLC_LOCK.lock().unwrap() {
+                        return;
+                    }
+                    let evict_threshold = evict;
+                    let restore_threshold = restore;
 
-            if *CTRLC_LOCK.lock().unwrap(){
-                return;
-            }
-            let evict_threshold = evict;
-            let restore_threshold = restore;
+                    let _test_folder = format!(
+                        "tests/0223llama_7b_chat_1240_logits_sink_mix_dynamic-sink[{}]-hist[{}]-evict[{}]-restor[{}]",
+                        max_sink_size,
+                        max_window_size,
+                        evict_threshold,
+                        restore_threshold,
+                    );
+                    // set path
+                    println!("\n\n-----------------------\ngenerating for prompt: {}", prompt_idx);
+                    let _file_path = format!("{_test_folder}/test_{}", prompt_idx);
+                    let _file_path = Path::new(&_file_path);
+                    let history_path = _file_path.join("history.bin");
+                    let prompt_path = _file_path.join(format!("1-prompts-{}-{}.txt", evict, restore));
+                    fs::create_dir_all(&_file_path).unwrap();
 
-            let _test_folder = format!(
-                "tests/0223llama_7b_chat_1240_logits_sink_mix_dynamic-sink[{}]-hist[{}]-evict[{}]-restor[{}]",
-                max_sink_size,
-                max_window_size,
-                evict_threshold,
-                restore_threshold,
-            );
-            // set path
-            println!("\n\n-----------------------\ngenerating for prompt: {}", prompt_idx);
-            let _file_path = format!("{_test_folder}/test_{}", prompt_idx);
-            let _file_path = Path::new(&_file_path);
-            let history_path = _file_path.join("history.bin");
-            let prompt_path = _file_path.join(format!("1-prompts-{}-{}.txt", evict, restore));
-            let element_path= _file_path.join(format!("1-ele-{}-{}.txt", evict, restore));
-            fs::create_dir_all(&_file_path).unwrap();
-
-            // let mut save_path = SAVE_PATH.write().unwrap();
-            // *save_path = file_path.clone();
-            // drop(save_path);
-            // clear the cache
-            let mut real_prompt = build_prompt(&prompt);
-            let mut history = vec![];
-            let cache = model::StreamCache::new(!args.no_kv_cache, dtype, &config, &device).unwrap();
+                    // let mut save_path = SAVE_PATH.write().unwrap();
+                    // *save_path = file_path.clone();
+                    // drop(save_path);
+                    // clear the cache
+                    let mut real_prompt = build_prompt(&prompt);
+                    let mut history = vec![];
+                    let cache = model::StreamCache::new(!args.no_kv_cache, dtype, &config, &device).unwrap();
 
 
-            let mut tokens = tokenizer
-                .encode(real_prompt.as_str(), true)
-                .map_err(E::msg).unwrap()
-                .get_ids()
-                .to_vec();
+                    let mut tokens = tokenizer
+                        .encode(real_prompt.as_str(), true)
+                        .map_err(E::msg).unwrap()
+                        .get_ids()
+                        .to_vec();
 
-            println!("starting the inference loop");
-            let mut logits_processor =
-                LogitsProcessor::new(args.seed, args.temperature, args.top_p);
-            let start_gen = std::time::Instant::now();
-            let mut index_pos = 0;
-            let mut token_generated = 0;
-            print!("{real_prompt}");
+                    println!("starting the inference loop");
+                    let mut logits_processor =
+                        LogitsProcessor::new(args.seed, args.temperature, args.top_p);
+                    let start_gen = std::time::Instant::now();
+                    let mut index_pos = 0;
+                    let mut token_generated = 0;
+                    print!("{real_prompt}");
 
-            // first feed the prompt
-            // first feed 0..MAX_SINK_SIZE + MAX_WINDOW_SIZE
-            let ctxt = &tokens[0..(max_sink_size + max_window_size).min(tokens.len() - 1)];
-            let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
-            let _logits = llama.forward(&input, 0,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
+                    // first feed the prompt
+                    // first feed 0..MAX_SINK_SIZE + MAX_WINDOW_SIZE
+                    let ctxt = &tokens[0..(max_sink_size + max_window_size).min(tokens.len() - 1)];
+                    let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
+                    let _logits = llama.forward(&input, 0, max_sink_size, max_window_size, evict_threshold, restore_threshold, &cache).unwrap();
+                    index_pos += ctxt.len();
 
-            index_pos += ctxt.len();
-           
-            // then feed the rest one by one
-            for i in (max_sink_size + max_window_size)..(tokens.len() - 1) {
-               
-                // one token from the prompt
-                let ctxt = &tokens[i..(i + 1)];
-                let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
+                    // then feed the rest one by one
+                    for i in (max_sink_size + max_window_size)..(tokens.len() - 1) {
 
-                history.push(cache.current_msb_index.lock().unwrap().clone());
-                if *CTRLC_LOCK.lock().unwrap() {
-                    // save and return
-                    final_save_file(&history_path, &history);
-                    return;
-                }
+                        // one token from the prompt
+                        let ctxt = &tokens[i..(i + 1)];
+                        let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
 
-                let _logits = llama.forward(&input, index_pos,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
+                        history.push(cache.current_round_evict_restore.lock().unwrap().clone());
+                        if *CTRLC_LOCK.lock().unwrap() {
+                            // save and return
+                            final_save_file(&history_path, &history);
+                            return;
+                        }
 
-                index_pos += ctxt.len();
-                info!("{}/{} tokens in prompt finished", i, (tokens.len() - 1 - 1));
-            }
-            // then feed the rest
-            for _index in 0..100 {
-             
-                // always fetch the last token inserted
-                let ctxt = &tokens[(tokens.len() - 1)..];
-                let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
+                        let _logits = llama.forward(&input, index_pos, max_sink_size, max_window_size, evict_threshold, restore_threshold, &cache).unwrap();
 
-                history.push(cache.current_msb_index.lock().unwrap().clone());
-                if *CTRLC_LOCK.lock().unwrap() {
-                    // save and return
-                    final_save_file(&history_path, &history);
-                    return;
-                }
+                        index_pos += ctxt.len();
+                        info!("{}/{} tokens in prompt finished", i, (tokens.len() - 1 - 1));
+                    }
+                    // then feed the rest
+                    for _index in 0..100 {
 
-                let logits = llama.forward(&input, index_pos,max_sink_size,max_window_size,evict_threshold,restore_threshold,&cache).unwrap();
-                let logits = logits.squeeze(0).unwrap();
-                // println!("logits shape: {:.unwrap()}", logits.shape());
-                // println!("logits: {:.unwrap()}", logits.to_vec1::<f32>());
-                let logits = if args.repeat_penalty == 1. {
-                    logits
-                } else {
-                    let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-                    candle_transformers::utils::apply_repeat_penalty(
-                        &logits,
-                        args.repeat_penalty,
-                        &tokens[start_at..],
-                    ).unwrap()
-                };
-                index_pos += ctxt.len();
+                        // always fetch the last token inserted
+                        let ctxt = &tokens[(tokens.len() - 1)..];
+                        let input = Tensor::new(ctxt, &device).unwrap().unsqueeze(0).unwrap();
 
-                let next_token = logits_processor.sample(&logits).unwrap();
-                token_generated += 1;
-                tokens.push(next_token);
+                        history.push(cache.current_round_evict_restore.lock().unwrap().clone());
+                        if *CTRLC_LOCK.lock().unwrap() {
+                            // save and return
+                            final_save_file(&history_path, &history);
+                            return;
+                        }
 
-                // Extracting the last token as a string is complicated, here we just apply some simple
-                // heuristics as it seems to work well enough for this example. See the following for more
-                // details:
-                // https://github.com/huggingface/tokenizers/issues/1141#issuecomment-1562644141
-                if let Some(text) = tokenizer.id_to_token(next_token) {
-                    let text = text.replace('▁', " ").replace("<0x0A>", "\n");
-                    real_prompt.extend(text.chars());
+                        let logits = llama.forward(&input, index_pos, max_sink_size, max_window_size, evict_threshold, restore_threshold, &cache).unwrap();
+                        let logits = logits.squeeze(0).unwrap();
+                        // println!("logits shape: {:.unwrap()}", logits.shape());
+                        // println!("logits: {:.unwrap()}", logits.to_vec1::<f32>());
+                        let logits = if args.repeat_penalty == 1. {
+                            logits
+                        } else {
+                            let start_at = tokens.len().saturating_sub(args.repeat_last_n);
+                            candle_transformers::utils::apply_repeat_penalty(
+                                &logits,
+                                args.repeat_penalty,
+                                &tokens[start_at..],
+                            ).unwrap()
+                        };
+                        index_pos += ctxt.len();
 
-                    print!("{text}");
-                    std::io::stdout().flush().unwrap();
-                }
-                if Some(next_token) == eos_token_id {
-                    break;
-                }
-            }
-            let dt = start_gen.elapsed();
-            println!(
-                "\n\n{} tokens generated ({} token/s)\n",
-                token_generated,
-                token_generated as f64 / dt.as_secs_f64(),
-            );
-            // save the generated text
-            let cache = cache.global_mask.lock().unwrap();
-            let blocks = cache.len();
-            let headers = cache[0].len();
-            let num_false = cache
-                .iter()
-                .flatten()
-                .flatten()
-                .map(|x| if *x { 0 } else { 1 })
-                .sum::<usize>();
-            let total_element = index_pos * blocks * headers;
+                        let next_token = logits_processor.sample(&logits).unwrap();
+                        token_generated += 1;
+                        tokens.push(next_token);
 
-            // fix bug here, each config should write to different file
-            let mut f = File::create(
-                &prompt_path
-            )
-            .unwrap();
-            let mut element = File::create(
-                &element_path
-            )
-            .unwrap();
-            f.write_all(real_prompt.as_bytes()).unwrap();
-            final_save_file(&history_path,&history);
-            element
-                .write_all(
-                    format!(
-                        "total: {}, num_false: {}, ratio: {}\n",
-                        total_element,
-                        num_false,
-                        (num_false as f32 / total_element as f32)
+                        // Extracting the last token as a string is complicated, here we just apply some simple
+                        // heuristics as it seems to work well enough for this example. See the following for more
+                        // details:
+                        // https://github.com/huggingface/tokenizers/issues/1141#issuecomment-1562644141
+                        if let Some(text) = tokenizer.id_to_token(next_token) {
+                            let text = text.replace('▁', " ").replace("<0x0A>", "\n");
+                            real_prompt.extend(text.chars());
+
+                            print!("{text}");
+                            std::io::stdout().flush().unwrap();
+                        }
+                        if Some(next_token) == eos_token_id {
+                            break;
+                        }
+                    }
+                    let dt = start_gen.elapsed();
+                    println!(
+                        "\n\n{} tokens generated ({} token/s)\n",
+                        token_generated,
+                        token_generated as f64 / dt.as_secs_f64(),
+                    );
+
+
+                    // fix bug here, each config should write to different file
+                    let mut f = File::create(
+                        &prompt_path
                     )
-                    .as_bytes())
-                .unwrap();
-        });
+                        .unwrap();
 
+                    f.write_all(real_prompt.as_bytes()).unwrap();
+                    final_save_file(&history_path, &history);
+
+                });
             }
-            
-        ) ;
+        );
     });
 
     Ok(())
@@ -435,6 +408,7 @@ pub fn fetch_all_user_prompt() -> anyhow::Result<Vec<Vec<(String, String)>>> {
         .collect();
     Ok(all_c)
 }
+
 pub fn fetch_all_user_prompt_lazy() -> anyhow::Result<Vec<String>> {
     let file_names = [
         "train-00002-of-00006-1779b7cec9462180.parquet",
@@ -493,12 +467,13 @@ pub fn fetch_all_user_prompt_lazy() -> anyhow::Result<Vec<String>> {
 mod tests {
     use std::{fs::File, path::Path};
 
-    use super::*;
     use itertools::Itertools;
     use polars::{
         io::{parquet::ParquetReader, SerReader},
         lazy::frame::LazyFrame,
     };
+
+    use super::*;
 
     #[test]
     #[ignore]
@@ -520,7 +495,7 @@ mod tests {
                 .into(),
             Default::default(),
         )
-        .unwrap();
+            .unwrap();
 
         println!("{:?}", df.collect().unwrap().get_column_names());
     }
@@ -565,7 +540,7 @@ mod tests {
                     AnyValue::String(s) => s,
                     _ => panic!(""),
                 };
-                println!("{:?} : {:?}", talk_row, talk_data,);
+                println!("{:?} : {:?}", talk_row, talk_data, );
             });
             // println!("{:?}", talk);
         });
@@ -634,7 +609,7 @@ mod tests {
 
     fn fetch_all_cov(
         c: &ChunkedArray<ListType>,
-    ) -> impl Iterator<Item = Vec<(String, String)>> + '_ {
+    ) -> impl Iterator<Item=Vec<(String, String)>> + '_ {
         let all_cov = c.into_iter().take(10).map(|s| {
             let s = s.unwrap();
             let talk = s.struct_().unwrap();

@@ -4,10 +4,11 @@ use std::{
     ops::Add,
 };
 
-use candle_transformers::models::llama_sink_mix_dynamic::MsbIndexItem;
 use serde::{Deserialize, Serialize};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
+
+use candle_transformers::models::llama_sink_mix_dynamic::MsbIndexItem;
 
 pub fn init_logger() {
     tracing_subscriber::fmt::SubscriberBuilder::default()

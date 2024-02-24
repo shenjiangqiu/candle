@@ -9,10 +9,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use candle::{CpuStorage, CustomOp1, D, Device, DType, IndexOp, Result, Tensor};
+use candle::{CpuStorage, CustomOp1, DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 
-use super::with_tracing::{Linear, linear_no_bias as linear};
+use super::with_tracing::{linear_no_bias as linear, Linear};
 
 /// changes here: allow super long sequences
 pub const MAX_SEQ_LEN: usize = 4096;
@@ -348,7 +348,7 @@ impl CausalSelfAttention {
         // println!("start att");
         let cache_len = k.dims4().unwrap().2;
         if seq_len != 1 {
-            info!("start the inital prompt block:{}", block_idx);
+            // info!("start the inital prompt block:{}", block_idx);
             let start = Instant::now();
             // work as original
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
@@ -365,17 +365,17 @@ impl CausalSelfAttention {
             let y = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
             let y = self.o_proj.forward(&y)?;
-            info!(
-                "finished att block in batch mode {}, time: {:?}",
-                block_idx,
-                start.elapsed()
-            );
+            // info!(
+            //     "finished att block in batch mode {}, time: {:?}",
+            //     block_idx,
+            //     start.elapsed()
+            // );
             Ok(y)
         } else {
             // for each generation stage, record current cache mask
             // let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             // if the seq_len is 1 just do it with the parts
-            info!("start the step att:{}", block_idx);
+            // info!("start the step att:{}", block_idx);
             let start = Instant::now();
             if cache_len <= max_window_size + max_sink_size {
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
@@ -396,14 +396,15 @@ impl CausalSelfAttention {
                 Ok(y)
             } else {
                 let mut global_mask = cache.global_mask.lock().unwrap();
-                let mut current_round_evict_restore = cache.current_round_evict_restore.lock().unwrap();
+                let mut current_round_evict_restore =
+                    cache.current_round_evict_restore.lock().unwrap();
                 let mut current_msb = cache.current_msb_index.lock().unwrap();
                 let (full_mask, msb_mask) =
                     special_handle(cache_len, &global_mask[block_idx], k.dims()[3]);
                 // apply the mask to k and v
                 // the dim for k is (1, headers, seq_len, head_dim), the mask is (headers,seq_len)
                 let time = start.elapsed();
-                info!("finished shpecial handle: {time:?}");
+                // info!("finished shpecial handle: {time:?}");
                 let full_part = k.mul(&full_mask).unwrap();
                 let msb_part = k_msb.mul(&msb_mask).unwrap();
                 let k = full_part.add(&msb_part).unwrap();
@@ -413,14 +414,14 @@ impl CausalSelfAttention {
                 let v = full_part.add(&msb_part).unwrap();
 
                 let time = start.elapsed();
-                info!("finished QK: {time:?}");
+                // info!("finished QK: {time:?}");
 
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
                 let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
                 let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
                 let att = candle_nn::ops::softmax(&att, D::Minus1)?;
                 let time = start.elapsed();
-                info!("finished QKV: {time:?}");
+                // info!("finished QKV: {time:?}");
                 // update the global mask
                 Self::update_global_mask(
                     block_idx,
@@ -439,8 +440,8 @@ impl CausalSelfAttention {
                 let y = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
                 let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
                 let y = self.o_proj.forward(&y)?;
-                let time = start.elapsed();
-                info!("finshed step 1: {time:?}");
+                // let time = start.elapsed();
+                // info!("finshed step 1: {time:?}");
                 // info!("finished att block {}", block_idx);
                 Ok(y)
             }
@@ -459,8 +460,11 @@ impl CausalSelfAttention {
         evict_threshold: f32,
         restore_threshold: f32,
     ) {
-        current_round_evict_restore.restore.clear();
-        current_round_evict_restore.evict.clear();
+        if block_idx == 0 {
+            current_round_evict_restore.restore.clear();
+            current_round_evict_restore.evict.clear();
+        }
+
         if seq_len != 1 {
             panic!("seq_len should be 1");
         }
@@ -504,20 +508,23 @@ impl CausalSelfAttention {
             }
             // restore the mask if the score is large
             for out_window_index in max_sink_size..tokenindex_to_be_evicted {
-                let score = atten_header.get_on_dim(2, out_window_index).unwrap();
-                let score: f32 = score.flatten_all().unwrap().to_vec1().unwrap()[0];
-                if score > restore_threshold {
-                    cache[header][out_window_index] = true;
-                    current_msb_history.1.remove(&MsbIndexItem {
-                        block_idx,
-                        header,
-                        seq: out_window_index,
-                    });
-                    current_round_evict_restore.restore.insert(MsbIndexItem {
-                        block_idx,
-                        header,
-                        seq: out_window_index,
-                    });
+                if cache[header][out_window_index] == false {
+                    let score = atten_header.get_on_dim(2, out_window_index).unwrap();
+                    let score: f32 = score.flatten_all().unwrap().to_vec1().unwrap()[0];
+                    if score > restore_threshold {
+                        cache[header][out_window_index] = true;
+                        let removed = current_msb_history.1.remove(&MsbIndexItem {
+                            block_idx,
+                            header,
+                            seq: out_window_index,
+                        });
+                        assert!(removed);
+                        current_round_evict_restore.restore.insert(MsbIndexItem {
+                            block_idx,
+                            header,
+                            seq: out_window_index,
+                        });
+                    }
                 }
             }
             current_msb_history.0 = index_pos;

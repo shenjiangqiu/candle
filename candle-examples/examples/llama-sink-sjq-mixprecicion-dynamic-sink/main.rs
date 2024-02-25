@@ -197,15 +197,14 @@ fn main() -> Result<()> {
     // ENABLE_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
     println!("fetching the user prompt");
     use rayon::prelude::*;
-    for (prompt_idx, prompt) in fetch_all_user_prompt()
+    fetch_all_user_prompt()
         .unwrap()
-        .into_iter()
-        .filter(|i| limit_len(i, 1240, 4000))
-        .take(20)
-        .enumerate()
-    {
+        .into_par_iter().enumerate()
+        .filter(|i| limit_len(&i.1, 1240, 4000))
+        .take_any(20)
+       .for_each(|(prompt_idx, prompt)| {
         if *CTRLC_LOCK.lock().unwrap() {
-            return Ok(());
+            return ;
         }
         [(0.01, 0.02), (0.02, 0.05), (0.05, 0.1)].into_par_iter().for_each(|(evict, restore)|
         {
@@ -349,7 +348,7 @@ fn main() -> Result<()> {
             });
         }
     );
-    }
+    });
 
     Ok(())
 }

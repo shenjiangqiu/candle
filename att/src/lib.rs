@@ -19,6 +19,15 @@ pub fn init_logger() {
         )
         .init();
 }
+pub fn init_logger_debug() {
+    tracing_subscriber::fmt::SubscriberBuilder::default()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::DEBUG.into())
+                .from_env_lossy(),
+        )
+        .init();
+}
 /// ones , zeros, recalculate, others
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MySum(pub usize, pub usize, pub usize, pub usize);

@@ -97,15 +97,16 @@ pub struct Cache {
     device: Device,
     pub all_att: Arc<Mutex<AttRecord>>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, derive_more::From, derive_more::Into)]
 pub struct SingleTimeAttRecord {
     pub att: Vec<f32>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, derive_more::From, derive_more::Into)]
 pub struct SingleLocationRecord {
     pub time_line: Vec<SingleTimeAttRecord>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, derive_more::From, derive_more::Into)]
 pub struct AttRecord {
     pub all_records: Vec<Vec<SingleLocationRecord>>,
 }
@@ -169,9 +170,7 @@ impl Cache {
         if let Some(mask) = masks.get(&t) {
             Ok(mask.clone())
         } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
+            let mask: Vec<_> = (0..t).flat_map(|i| (0..t).map(move |j| u8::from(j > i))).collect();
             let mask = Tensor::from_slice(&mask, (t, t), &self.device)?;
             masks.insert(t, mask.clone());
             Ok(mask)
@@ -223,13 +222,7 @@ struct CausalSelfAttention {
 }
 
 #[cfg(feature = "flash-attn")]
-fn flash_attn(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> Result<Tensor> {
+fn flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32, causal: bool) -> Result<Tensor> {
     candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
@@ -437,11 +430,7 @@ impl Block {
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cache, cfg)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
         let rms_1 = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::load(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+        let rms_2 = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
         Ok(Self {
             rms_1,
             attn,

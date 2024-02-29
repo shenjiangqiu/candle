@@ -54,22 +54,40 @@ fn main() {
         let record = record.all_records;
         let thread_pool = rayon::ThreadPoolBuilder::new().build().unwrap();
         thread_pool.scope(|scope| {
+            let report_path = &report_path;
+            let record = &record;
             for (sink,window) in [(4,1024),(4,1)] {
-                for (ave,cur,rst) in [
-                    (Some(0.1),Some(0.1),Some(0.2)),
-                (Some(0.1),Some(0.1),Some(0.2)),
-                (Some(0.1),Some(0.1),Some(0.2)),
-                (Some(0.1),Some(0.1),Some(0.2))]{
+                for (evict,restore) in [
+                    (0.01,0.02),
+                    (0.02,0.04),
+                    (0.04,0.08),
+                    (0.08,0.16),
 
+                ]{
+                    for (ave,cur,rst) in [
+                        (Some(evict),Some(evict),Some(restore)),
+                        (Some(evict),None,Some(restore)),
+                        (None,Some(evict),Some(restore)),
+                        (Some(evict),Some(evict),None),
+                        (Some(evict),None,None),
+                        (None,Some(evict),None),
+                    ]{
+                        for cache_size in [4,8,16]{
+                            scope.spawn( move |_| {
+                                run_analyzer_and_save_report(
+                                    AverageWindowAnalyzer::new(window, sink, 
+                                        ave, cur, rst, cache_size),
+                                    &record,
+                                    &report_path,
+                                );
+                            });
+                        }
+                        
+                    }
                 }
+                
             }
-            scope.spawn(|_| {
-                run_analyzer_and_save_report(
-                    AverageWindowAnalyzer::new(32, 32, None, None, None, 4),
-                    &record,
-                    &report_path,
-                );
-            });
+          
         });
         // run all the analyzers
         let sink_window_analyzer = AverageWindowAnalyzer::new(32, 32, None,None, None,4);

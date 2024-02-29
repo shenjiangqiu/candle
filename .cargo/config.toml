@@ -8,4 +8,4 @@ rustflags = ["-C", "target-feature=+simd128"]
 rustflags = ["-C", "target-feature=-avx,-avx2"]
 
 [profile.release]
-lto = true
+lto = false

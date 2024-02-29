@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::{fs::File, io::BufReader};
 
 use att::Stat;

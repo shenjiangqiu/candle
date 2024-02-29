@@ -11,20 +11,19 @@ use candle_transformers::models::llama_sink_mix_dynamic::MsbIndexItem;
 use itertools::Itertools;
 type MsbItems = (usize, BTreeSet<MsbIndexItem>);
 fn main() {
-    use rayon::prelude::*;
     [(0.01, 0.02), (0.02, 0.05), (0.05, 0.1)].into_iter().for_each(|(evict, restore)| {
         let base_name = format!("tests/0223llama_7b_chat_1240_logits_sink_mix_dynamic-sink[4]-hist[1024]-evict[{evict}]-restor[{restore}]/test_0");
-            let base_name = Path::new(&base_name);
-            let file_name = base_name.join(format!("cache_mask.bin"));
-            let file = BufReader::new(
-                File::open(&file_name).expect(&format!("fail to open file : {file_name:?}")),
-            );
-            println!("reading files");
-            let msb_items: Vec<MsbItems> = bincode::deserialize_from(file).unwrap();
-            [4, 6, 8].into_iter().for_each(|cache_size| {
+        let base_name = Path::new(&base_name);
+        let file_name = base_name.join(format!("cache_mask.bin"));
+        let file = BufReader::new(
+            File::open(&file_name).expect(&format!("fail to open file : {file_name:?}")),
+        );
+        println!("reading files");
+        let msb_items: Vec<MsbItems> = bincode::deserialize_from(file).unwrap();
+        [4, 6, 8].into_iter().for_each(|cache_size| {
 
-        let mut stat = Stat::new(evict, restore, cache_size);            
-        println!("start");
+            let mut stat = Stat::new(evict, restore, cache_size,0,0);
+            println!("start");
             let mut previouse = Option::None;
 
             for (item, index_pos) in msb_items.iter().zip(1028..) {
@@ -100,7 +99,7 @@ fn update_result(stat: &mut Stat, previouse: &Option<MsbItems>, current: &MsbIte
                 .entry(item.seq.to_string())
                 .or_default()
                 .add_assign(1);
-            
+
             stat.dyn_state.restore_block_count_histogram[item.block_idx] += 1;
 
             if let Some(gap) = in_cache(&item, &stat.dyn_state.current_cache) {

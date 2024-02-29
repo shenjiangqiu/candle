@@ -1,7 +1,7 @@
 use super::with_tracing::{linear_no_bias as linear, Linear};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -95,6 +95,44 @@ pub struct Cache {
     cos: Tensor,
     sin: Tensor,
     device: Device,
+    pub all_att: Arc<Mutex<AttRecord>>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SingleTimeAttRecord {
+    pub att: Vec<f32>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SingleLocationRecord {
+    pub time_line: Vec<SingleTimeAttRecord>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttRecord {
+    pub all_records: Vec<Vec<SingleLocationRecord>>,
+}
+impl Default for AttRecord {
+    fn default() -> Self {
+        let all_headers = vec![Default::default(); 32];
+        let all_blocks = vec![all_headers; 32];
+        Self {
+            all_records: all_blocks,
+        }
+    }
+}
+impl AttRecord {
+    pub fn apply_att(&mut self, block_idx: usize, att: &Tensor) {
+        // the dim is (b_sz, 32, input_len, history_len)
+        println!("att {:?}", att.dims());
+        let (b_sz, nheads, input_len, history_len) = att.dims4().unwrap();
+        assert!(b_sz == 1);
+        let att = att.reshape((nheads, input_len, history_len)).unwrap();
+        let att = att.to_vec3::<f32>().unwrap();
+        for (att_head, record) in att.into_iter().zip(self.all_records[block_idx].iter_mut()) {
+            for att_head_time in att_head {
+                let time_record = SingleTimeAttRecord { att: att_head_time };
+                record.time_line.push(time_record);
+            }
+        }
+    }
 }
 
 impl Cache {
@@ -122,6 +160,7 @@ impl Cache {
             device: device.clone(),
             cos,
             sin,
+            all_att: Default::default(),
         })
     }
 
@@ -146,6 +185,8 @@ impl Cache {
         }
         let mut masks = self.masks.lock().unwrap();
         masks.clear();
+
+        *self.all_att.lock().unwrap() = Default::default();
     }
 }
 
@@ -273,7 +314,8 @@ impl CausalSelfAttention {
 
             let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
             let att = candle_nn::ops::softmax(&att, D::Minus1)?;
-
+            let mut att_record = self.cache.all_att.lock().unwrap();
+            att_record.apply_att(block_idx, &att);
             // println!("att {:?}", att.dims());
             if ENABLE_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
                 let path = SAVE_PATH.read().unwrap();

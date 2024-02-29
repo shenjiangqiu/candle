@@ -349,7 +349,7 @@ impl CausalSelfAttention {
         let cache_len = k.dims4().unwrap().2;
         if seq_len != 1 {
             // info!("start the inital prompt block:{}", block_idx);
-            let start = Instant::now();
+            // let start = Instant::now();
             // work as original
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             // println!("end att");
@@ -376,7 +376,7 @@ impl CausalSelfAttention {
             // let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             // if the seq_len is 1 just do it with the parts
             // info!("start the step att:{}", block_idx);
-            let start = Instant::now();
+            // let start = Instant::now();
             if cache_len <= max_window_size + max_sink_size {
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
                 // println!("end att");
@@ -403,7 +403,7 @@ impl CausalSelfAttention {
                     special_handle(cache_len, &global_mask[block_idx], k.dims()[3]);
                 // apply the mask to k and v
                 // the dim for k is (1, headers, seq_len, head_dim), the mask is (headers,seq_len)
-                let time = start.elapsed();
+                // let time = start.elapsed();
                 // info!("finished shpecial handle: {time:?}");
                 let full_part = k.mul(&full_mask).unwrap();
                 let msb_part = k_msb.mul(&msb_mask).unwrap();
@@ -413,14 +413,14 @@ impl CausalSelfAttention {
                 let msb_part = v_msb.mul(&msb_mask).unwrap();
                 let v = full_part.add(&msb_part).unwrap();
 
-                let time = start.elapsed();
+                // let time = start.elapsed();
                 // info!("finished QK: {time:?}");
 
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
                 let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
                 let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
                 let att = candle_nn::ops::softmax(&att, D::Minus1)?;
-                let time = start.elapsed();
+                // let time = start.elapsed();
                 // info!("finished QKV: {time:?}");
                 // update the global mask
                 Self::update_global_mask(

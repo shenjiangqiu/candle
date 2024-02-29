@@ -50,6 +50,8 @@ pub struct Config {
     pub evict: f32,
     pub restore: f32,
     pub cache_remain_time: usize,
+    pub sink_size: usize,
+    pub window_size: usize,
 }
 #[derive(Serialize, Deserialize)]
 pub struct DynStat {
@@ -64,18 +66,27 @@ pub struct DynStat {
     pub restore_seq_count_histogram: BTreeMap<String, usize>,
     pub restore_block_count_histogram: [usize; 32],
 }
+
 #[derive(Serialize, Deserialize)]
 pub struct Stat {
     pub config: Config,
     pub dyn_state: DynStat,
 }
 impl Stat {
-    pub fn new(evict: f32, restore: f32, cache_size: usize) -> Self {
+    pub fn new(
+        evict: f32,
+        restore: f32,
+        cache_size: usize,
+        sink_size: usize,
+        window_size: usize,
+    ) -> Self {
         Self {
             config: Config {
                 evict,
                 restore,
                 cache_remain_time: cache_size,
+                sink_size,
+                window_size,
             },
             dyn_state: DynStat {
                 total_restores: 0,

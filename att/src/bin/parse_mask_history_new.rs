@@ -31,18 +31,27 @@ fn main() {
                 let _file_path = format!("{_test_folder}/test_{}", prompt_idx);
                 let _file_path = Path::new(&_file_path);
                 let history_path = _file_path.join("history.bin");
-                let prompt_path = _file_path.join(format!("1-prompts-{}-{}.txt", evict, restore));
+                // let prompt_path = _file_path.join(format!("1-prompts-{}-{}.txt", evict, restore));
+                let history_items:Vec<CurrentRoundEvictRestore> = bincode::deserialize_from(BufReader::new(File::open(&history_path).unwrap())).unwrap();
+                [4, 6, 8].into_iter().for_each(|cache_size| {
 
-                let mut stat = Stat::new(evict ,restore,4 );
-                println!("hello ")
-        });            
+                    let mut stat = Stat::new(evict, restore, cache_size,max_sink_size,max_window_size);
+                    println!("start");
+                    for (item, index_pos) in history_items.iter().zip(max_sink_size..) {
+                        update_result(&mut stat,  &item, index_pos);
+                    }
+                    let result_name = format!("result-{evict}-{restore}-{cache_size}.json");
+                    let writer = BufWriter::new(File::create(&result_name).unwrap());
+                    serde_json::to_writer_pretty(writer, &stat).unwrap();
+                });
+        });
     });
 }
 
 fn update_result(stat: &mut Stat, current: &CurrentRoundEvictRestore, step: usize) {
-    let evict_index = step - 1024 - 1;
+    let evict_index = step - stat.config.window_size - 1;
     // no evict and stores yet
-    if evict_index < 4 {
+    if evict_index < stat.config.sink_size {
         println!("evict index: {evict_index}, continue");
         return;
     }
@@ -51,17 +60,9 @@ fn update_result(stat: &mut Stat, current: &CurrentRoundEvictRestore, step: usiz
 
     // update evict
     // println!("step :{step}, previouse: {previouse:?},current: {current:?}");
-    let current_evicted = current.1.iter().filter(|x| x.seq == evict_index).count();
-    debug_assert_eq!(
-        0,
-        current
-            .1
-            .iter()
-            .filter(|x| x.seq == evict_index + 1)
-            .count(),
-        "this location is still in the window, should not be evicted!"
-    );
-
+    let current_evicted = &current.evict;
+    let current_restore = &current.restore;
+    let current_evicted = current_evicted.len();
     println!("{current_evicted}/1024 items evicted in location: {evict_index}");
     stat.dyn_state.total_tests += 32 * 32;
     stat.dyn_state.total_evicts += current_evicted;
@@ -70,58 +71,55 @@ fn update_result(stat: &mut Stat, current: &CurrentRoundEvictRestore, step: usiz
         .push((evict_index, current_evicted));
 
     // update restore
-    if let Some(previouse) = previouse {
-        // the restored elements
-        // note that the current_restore is already sorted by block id, so do not need to sort it again!!
-        // apply the cache block-by-block
-        let current_restored = previouse.1.difference(&current.1).cloned();
-        debug_assert!({
-            current_restored
-                .clone()
-                .into_iter()
-                .map(|a| a.block_idx)
-                .tuple_windows()
-                .all(|(a, b)| a <= b)
-        });
-        // push a new slot into cache
-        stat.dyn_state.current_cache.push_back(BTreeSet::new());
-        // first count cache coverage
-        // current block requests should be merged
-        for item in current_restored {
-            stat.dyn_state.total_restores += 1;
-            let key = format!("seq-{}-gap-{}", item.seq, evict_index - item.seq);
-            stat.dyn_state
-                .restore_count_histogram
-                .entry(key)
-                .or_default()
-                .add_assign(1);
+    // the restored elements
+    // note that the current_restore is already sorted by block id, so do not need to sort it again!!
+    // apply the cache block-by-block
+    debug_assert!({
+        current_restore
+            .clone()
+            .into_iter()
+            .map(|a| a.block_idx)
+            .tuple_windows()
+            .all(|(a, b)| a <= b)
+    });
+    // push a new slot into cache
+    stat.dyn_state.current_cache.push_back(BTreeSet::new());
+    // first count cache coverage
+    // current block requests should be merged
+    for item in current_restore {
+        stat.dyn_state.total_restores += 1;
+        let key = format!("seq-{}-gap-{}", item.seq, evict_index - item.seq);
+        stat.dyn_state
+            .restore_count_histogram
+            .entry(key)
+            .or_default()
+            .add_assign(1);
 
-            stat.dyn_state
-                .restore_seq_count_histogram
-                .entry(item.seq.to_string())
-                .or_default()
-                .add_assign(1);
+        stat.dyn_state
+            .restore_seq_count_histogram
+            .entry(item.seq.to_string())
+            .or_default()
+            .add_assign(1);
 
-            stat.dyn_state.restore_block_count_histogram[item.block_idx] += 1;
+        stat.dyn_state.restore_block_count_histogram[item.block_idx] += 1;
 
-            if let Some(gap) = in_cache(&item, &stat.dyn_state.current_cache) {
-                stat.dyn_state.hit_histogram[gap] += 1;
-            } else {
-                // miss
-                let gap_between_added = evict_index - item.seq;
-                *stat
-                    .dyn_state
-                    .miss_histogram
-                    .entry(gap_between_added)
-                    .or_default() += 1;
-            }
-            stat.dyn_state
-                .current_cache
-                .back_mut()
-                .unwrap()
-                .insert(item);
-            // get the restore distence
+        if let Some(gap) = in_cache(&item, &stat.dyn_state.current_cache) {
+            stat.dyn_state.hit_histogram[gap] += 1;
+        } else {
+            // miss
+            let gap_between_added = evict_index - item.seq;
+            *stat
+                .dyn_state
+                .miss_histogram
+                .entry(gap_between_added)
+                .or_default() += 1;
         }
+        stat.dyn_state
+            .current_cache
+            .back_mut()
+            .unwrap()
+            .insert(item.clone());
+        // get the restore distence
         if stat.dyn_state.current_cache.len() > cache_size {
             // println!("the cache len is {},pop frot", {
             //     stat.dyn_state.current_cache.len()
